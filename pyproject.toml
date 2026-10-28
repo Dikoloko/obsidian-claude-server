@@ -1,0 +1,46 @@
+[project]
+name = "obsidian-web-mcp"
+version = "0.4.0"
+description = "Secure remote MCP server for Obsidian vaults -- access your notes from Claude, your phone, or any MCP client, anywhere"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # 2.x for protocol 2026-07-28; upstream pins <2 (their #71). See FORK.md.
+    "mcp[cli]>=2.3.0,<3",
+    "python-frontmatter>=1.1.0",
+    "ruamel.yaml>=0.18",
+    "pydantic>=2.0",
+    "watchdog>=4.0.0",
+    # Floor only, mcp pulls it in: below 1.3.1 the OAuth login forms are open to
+    # GHSA-82w8-qh3p-5jfq.
+    "starlette>=1.3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    # The semantic-search wiring tests run the real index with a stand-in encoder, so
+    # they need numpy but not the model (see tests/test_semantic_search.py).
+    "numpy>=1.26",
+]
+# The upstream "semantic" extra is removed in this fork: sentence-transformers below 5.6.0
+# can run code from a local model folder (GHSA-jhr6-gm9c-rqjv), and the feature is not needed.
+cloudflare-access = [
+    # mcp already ships pyjwt[crypto]>=2.10.1; this extra's job is the FLOOR, not the
+    # install. 2.13 preserves the JWKS cache on fetch errors; 2.14 adds redirect
+    # rejection and unknown-kid refresh rate-limiting. Below 2.14 all three regress.
+    "pyjwt>=2.14",
+    "cryptography>=42",
+]
+
+[project.scripts]
+vault-mcp = "obsidian_vault_mcp.server:main"
+vault-mcp-oauth = "obsidian_vault_mcp.oauth_admin:_entrypoint"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/obsidian_vault_mcp"]

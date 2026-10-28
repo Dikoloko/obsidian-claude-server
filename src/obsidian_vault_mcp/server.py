@@ -1,0 +1,1157 @@
+"""Obsidian Vault MCP Server.
+
+Exposes read/write access to an Obsidian vault over Streamable HTTP.
+Designed to run behind Cloudflare Tunnel for secure remote access.
+"""
+
+import atexit
+import json
+import logging
+import os
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import ValidationError
+
+from .config import (
+    VAULT_AUDIT_LOG_INCLUDE_READS,
+    VAULT_MCP_ALLOWED_HOSTS,
+    VAULT_MCP_FORWARDED_ALLOW_IPS,
+    VAULT_MCP_HEARTBEAT_URL,
+    VAULT_MCP_HOST,
+    VAULT_MCP_PATH,
+    VAULT_MCP_PORT,
+    VAULT_MCP_TOKEN,
+    VAULT_PATH,
+)
+from . import config
+from .frontmatter_index import FrontmatterIndex
+from .audit import (
+    run_audited,
+    read_only_refusal,
+    audit_enabled,
+    audit_log_path,
+    audit_path_inside_vault,
+    audit_path_writable,
+    build_audit_record,
+    should_audit_operation,
+    snapshot_path,
+    write_audit_record,
+)
+
+logger = logging.getLogger(__name__)
+
+# Global frontmatter index instance
+frontmatter_index = FrontmatterIndex()
+
+
+# Liveness pings don't need the response body; read just enough to complete the
+# request without pulling a large/hostile body into memory.
+_HEARTBEAT_MAX_BYTES = 1024
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow redirects on the heartbeat GET.
+
+    The configured URL is operator-trusted, but a redirect is not -- following one
+    would let a compromised/typo'd monitor bounce the ping to an arbitrary target
+    (incl. another scheme). Returning None makes urllib raise instead of follow.
+    """
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_heartbeat_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _heartbeat_ping(url: str) -> None:
+    """Send a single liveness GET. Split out from the loop so it is unit-testable.
+
+    Does not follow redirects and reads at most _HEARTBEAT_MAX_BYTES of the body.
+    """
+    with _heartbeat_opener.open(url, timeout=10) as resp:
+        resp.read(_HEARTBEAT_MAX_BYTES)
+
+
+def _heartbeat_forever(url: str, interval: int) -> None:
+    """Ping ``url`` every ``interval`` seconds for the process lifetime.
+
+    Runs in a daemon thread started from main() -- NOT the per-request MCP lifespan,
+    which fires on every request and would spawn a heartbeat per session. Failures
+    are logged and swallowed so a flaky monitor can never take the server down.
+    """
+    # The heartbeat URL is a capability URL (the secret is in the path), so log only
+    # the host + exception type on failure, never the full URL or exception string.
+    host = urllib.parse.urlsplit(url).hostname or "?"
+    while True:
+        try:
+            _heartbeat_ping(url)
+        except Exception as e:
+            logger.warning("Heartbeat ping to %s failed: %s", host, type(e).__name__)
+        time.sleep(interval)
+
+
+@asynccontextmanager
+async def lifespan(server):
+    """MCP lifespan.
+
+    It must NOT build or tear down the index: under mcp 1.x with stateless_http=True
+    it ran on EVERY HTTP request, and rebuilding the index per request timed out large
+    vaults (#28). mcp 2.x enters it once per app, but the rule stays. The index is
+    built once in main() before serving; here we only expose the already-built
+    instance to tools.
+    """
+    yield {"frontmatter_index": frontmatter_index}
+
+
+class AccessCheckedMCPServer(MCPServer):
+    """MCPServer that refuses a read-only caller every tool but a read, at dispatch.
+
+    Every tool call passes here, built-in or extension, whether or not the tool goes
+    through run_audited, and on both transport paths (the initialize handshake and the
+    2026-07-28 per-request one). The refusal goes through the tool's own result
+    conversion, so a tool that answers with text gives it as its usual {"error": ...}
+    answer; a tool whose output schema cannot carry that text gives it as a tool error.
+
+    mcp 2.x hides the text of any exception a tool raises. A tool's own input model
+    (the Vault*Input classes) refusing a value is not a crash, so its reason is passed
+    on as in 1.x, and the model can correct the call. Other exceptions stay hidden.
+    """
+
+    async def call_tool(self, name: str, arguments: dict, context=None):
+        tool = self._tool_manager.get_tool(name)
+        refusal = read_only_refusal(name, arguments) if tool is not None else None
+        if refusal is not None:
+            try:
+                return tool.fn_metadata.convert_result(refusal)
+            except Exception:
+                raise ToolError(json.loads(refusal)["error"]) from None
+        try:
+            return await super().call_tool(name, arguments, context)
+        except UnexpectedToolError as exc:
+            if isinstance(exc.__cause__, ValidationError):
+                raise ToolError(f"Error executing tool {name}: {exc.__cause__}") from exc.__cause__
+            raise
+
+
+# Create the MCP server. In mcp 2.x the transport settings go to streamable_http_app()
+# in build_app(), not to the constructor.
+mcp = AccessCheckedMCPServer("obsidian_web_mcp", lifespan=lifespan)
+
+TRANSPORT_SECURITY = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=[
+        "127.0.0.1:*",
+        "localhost:*",
+        "[::1]:*",
+        # Operator hostnames from VAULT_MCP_ALLOWED_HOSTS are appended to the
+        # loopback defaults above (set it to your tunnel/proxy hostname).
+        *VAULT_MCP_ALLOWED_HOSTS,
+    ],
+)
+
+
+# --- Register all tools ---
+
+from .tools.read import vault_read as _vault_read, vault_batch_read as _vault_batch_read
+from .tools.write import (
+    vault_append as _vault_append,
+    vault_edit as _vault_edit,
+    vault_write as _vault_write,
+)
+from .tools.upload import (
+    commit_direct_upload,
+    upload_dir,
+    validate_upload_grant,
+    vault_request_upload_url as _vault_request_upload_url,
+)
+from .tools.download import (
+    AUDIT_OPERATION as DOWNLOAD_AUDIT_OPERATION,
+    open_signed_download,
+    read_chunk,
+    vault_request_download_url as _vault_request_download_url,
+)
+from .tools.search import vault_search as _vault_search, vault_search_frontmatter as _vault_search_frontmatter
+from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete
+from .tools.daily import (
+    _daily_note_path,
+    _today,
+    vault_daily_note_path as _vault_daily_note_path,
+    vault_daily_note_read as _vault_daily_note_read,
+    vault_daily_note_append as _vault_daily_note_append,
+)
+from .tools.analytics import (
+    vault_analytics_summary as _vault_analytics_summary,
+    vault_analytics_findings as _vault_analytics_findings,
+)
+from .models import (
+    VaultReadInput,
+    VaultWriteInput,
+    VaultRequestUploadUrlInput,
+    VaultRequestDownloadUrlInput,
+    VaultEditInput,
+    VaultEditOperationInput,
+    VaultAppendInput,
+    VaultBatchReadInput,
+    VaultSearchInput,
+    VaultSearchFrontmatterInput,
+    VaultListInput,
+    VaultMoveInput,
+    VaultDeleteInput,
+    VaultDailyNoteAppendInput,
+    VaultAnalyticsSummaryInput,
+    VaultAnalyticsFindingsInput,
+)
+
+
+@mcp.tool(
+    name="vault_read",
+    description="Read a file from the Obsidian vault, returning content, metadata, and parsed YAML frontmatter.",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_read(path: str) -> str:
+    """Read a file from the vault."""
+    inp = VaultReadInput(path=path)
+    return run_audited("vault_read", lambda: _vault_read(inp.path), path=inp.path)
+
+
+@mcp.tool(
+    name="vault_batch_read",
+    description="Read multiple files from the vault in one call. Handles missing files gracefully.",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
+    """Read multiple files at once."""
+    inp = VaultBatchReadInput(paths=paths, include_content=include_content)
+    return run_audited("vault_batch_read", lambda: _vault_batch_read(inp.paths, inp.include_content))
+
+
+@mcp.tool(
+    name="vault_write",
+    description=(
+        "Create a Markdown note (.md) in the Obsidian vault. Creates parent directories by default. "
+        "By default it only creates: an existing file is left untouched and reported, also when two "
+        "calls race. If it reports the file exists, choose another name, or use vault_edit / "
+        "vault_append to change the existing note. overwrite=true replaces the whole file; use it "
+        "only when the user explicitly asks to replace that note. merge_frontmatter=true updates "
+        "the frontmatter of an existing note."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_write(
+    path: str,
+    content: str,
+    create_dirs: bool = True,
+    merge_frontmatter: bool = False,
+    overwrite: bool | None = None,
+) -> str:
+    """Write a file to the vault."""
+    inp = VaultWriteInput(
+        path=path, content=content, create_dirs=create_dirs,
+        merge_frontmatter=merge_frontmatter, overwrite=overwrite,
+    )
+    return run_audited(
+        "vault_write",
+        lambda: _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter, inp.effective_overwrite()),
+        path=inp.path,
+    )
+
+
+
+def register_upload_tool() -> None:
+    """Register vault_request_upload_url only when signed uploads are configured.
+
+    The tool hands out URLs for a route that answers without a bearer token. With
+    VAULT_UPLOAD_URL_SECRET unset that route does not exist, so the tool must not be
+    advertised either.
+    """
+    @mcp.tool(
+        name="vault_request_upload_url",
+        description=(
+            "Create a short-lived, single-use signed URL for uploading a binary file (image, PDF, or a type the operator added) "
+            "into the vault. The client POSTs the raw bytes to the URL with the matching Content-Type; "
+            "the bytes never pass through the conversation. Use it for files too large for "
+            "vault_write_binary's base64 argument."
+        ),
+        annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+    )
+    def vault_request_upload_url(
+        path: str,
+        media_type: str,
+        max_size_bytes: int,
+        overwrite: bool = False,
+        create_dirs: bool = True,
+        expected_sha256: str | None = None,
+        ttl_seconds: int | None = None,
+    ) -> str:
+        """Return a short-lived signed direct-upload URL."""
+        inp = VaultRequestUploadUrlInput(
+            path=path,
+            media_type=media_type,
+            max_size_bytes=max_size_bytes,
+            overwrite=overwrite,
+            create_dirs=create_dirs,
+            expected_sha256=expected_sha256,
+            ttl_seconds=ttl_seconds,
+        )
+        return _vault_request_upload_url(
+            inp.path, inp.media_type, inp.max_size_bytes, inp.overwrite,
+            inp.create_dirs, inp.expected_sha256, inp.ttl_seconds,
+        )
+
+if config.signed_upload_enabled():
+    register_upload_tool()
+
+
+def register_download_tool() -> None:
+    """Register vault_request_download_url only when signed downloads are configured.
+
+    The tool hands out URLs for a route that answers without a bearer token. With
+    VAULT_DOWNLOAD_URL_SECRET unset that route does not exist, so the tool must not be
+    advertised either.
+    """
+    @mcp.tool(
+        name="vault_request_download_url",
+        description=(
+            "Create a short-lived signed URL for downloading one vault file as raw bytes "
+            "(an image, a PDF, any file vault_read can reach). The client GETs the URL itself, for example "
+            "with curl; the bytes never pass through the conversation. Returns the size to verify."
+        ),
+        annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+    )
+    def vault_request_download_url(path: str, ttl_seconds: int | None = None) -> str:
+        """Return a short-lived signed direct-download URL."""
+        inp = VaultRequestDownloadUrlInput(path=path, ttl_seconds=ttl_seconds)
+        result = _vault_request_download_url(inp.path, inp.ttl_seconds)
+        # Audited like the serve in direct_download: path and size, no checksum.
+        # run_audited would snapshot a read's target with a checksum of the whole file,
+        # which is the hashing the stateless grant took out of issuing a URL.
+        if should_audit_operation("vault_request_download_url"):
+            parsed = json.loads(result)
+            write_audit_record(
+                build_audit_record(
+                    operation="vault_request_download_url",
+                    target_path=inp.path,
+                    before={"size": parsed.get("size"), "checksum": None},
+                    operation_status="error" if "error" in parsed else "success",
+                    error=parsed.get("error"),
+                )
+            )
+        return result
+
+if config.signed_download_enabled():
+    register_download_tool()
+
+
+@mcp.tool(
+    name="vault_edit",
+    description=(
+        "Patch an existing vault file with exact text replacements. Use this for token-efficient partial edits "
+        "when only small fragments change; supports dry-run diff previews and avoids resending the full file. "
+        "Each edit is an object {old_text, new_text}; old_text must match exactly once. Edits apply in order, "
+        "and dry_run simulates that same in-order apply (each old_text is matched against the running document "
+        "the earlier edits produce), so its diff and match counts predict the real apply, including chained edits."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_edit(path: str, edits: list[VaultEditOperationInput], dry_run: bool = False) -> str:
+    """Patch a file with exact text replacements."""
+    inp = VaultEditInput(path=path, edits=edits, dry_run=dry_run)
+    if inp.dry_run:
+        # A dry run writes nothing; don't record it as a mutation.
+        return _vault_edit(inp.path, [edit.model_dump() for edit in inp.edits], inp.dry_run)
+    return run_audited(
+        "vault_edit",
+        lambda: _vault_edit(inp.path, [edit.model_dump() for edit in inp.edits], inp.dry_run),
+        path=inp.path,
+    )
+
+
+@mcp.tool(
+    name="vault_append",
+    description=(
+        "Append content to a vault file without sending the existing file body. Use this for token-efficient "
+        "additions; creates the file when it does not exist."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_append(path: str, content: str, separator: str = "\n\n", create_dirs: bool = True) -> str:
+    """Append content to a file."""
+    inp = VaultAppendInput(path=path, content=content, separator=separator, create_dirs=create_dirs)
+    return run_audited(
+        "vault_append",
+        lambda: _vault_append(inp.path, inp.content, inp.separator, inp.create_dirs),
+        path=inp.path,
+    )
+
+
+
+@mcp.tool(
+    name="vault_search",
+    description="Search for text across vault files, matching note names/paths as well as contents. Filename matches are returned first (match_type 'filename'), then content matches (match_type 'content') with context lines and frontmatter excerpts.",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_search(
+    query: str,
+    path_prefix: str | None = None,
+    file_pattern: str | None = None,
+    max_results: int = 20,
+    context_lines: int = 2,
+) -> str:
+    """Search vault note names/paths and file contents."""
+    inp = VaultSearchInput(query=query, path_prefix=path_prefix, file_pattern=file_pattern, max_results=max_results, context_lines=context_lines)
+    return run_audited(
+        "vault_search",
+        lambda: _vault_search(inp.query, inp.path_prefix, inp.file_pattern, inp.max_results, inp.context_lines),
+    )
+
+
+@mcp.tool(
+    name="vault_search_frontmatter",
+    description="Search vault files by YAML frontmatter field values. Queries an in-memory index for fast results. Supports exact match, contains, and field-exists queries.",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_search_frontmatter(
+    field: str,
+    value: str = "",
+    match_type: str = "exact",
+    path_prefix: str | None = None,
+    max_results: int = 20,
+) -> str:
+    """Search by frontmatter fields."""
+    inp = VaultSearchFrontmatterInput(field=field, value=value, match_type=match_type, path_prefix=path_prefix, max_results=max_results)
+    return run_audited(
+        "vault_search_frontmatter",
+        lambda: _vault_search_frontmatter(inp.field, inp.value, inp.match_type, inp.path_prefix, inp.max_results),
+    )
+
+
+@mcp.tool(
+    name="vault_list",
+    description="List directory contents in the vault. Supports recursion depth, file/dir filtering, and glob patterns. Excludes .obsidian, .trash, .git directories.",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_list(
+    path: str = "",
+    depth: int = 1,
+    include_files: bool = True,
+    include_dirs: bool = True,
+    pattern: str | None = None,
+) -> str:
+    """List vault directory contents."""
+    inp = VaultListInput(path=path, depth=depth, include_files=include_files, include_dirs=include_dirs, pattern=pattern)
+    return run_audited(
+        "vault_list",
+        lambda: _vault_list(inp.path, inp.depth, inp.include_files, inp.include_dirs, inp.pattern),
+        path=inp.path,
+    )
+
+
+@mcp.tool(
+    name="vault_move",
+    description=(
+        "Move or rename a note or folder within the vault. A file keeps its file type: the "
+        "extension cannot change. Links that pointed at the moved note are repointed, the way "
+        "Obsidian does on a rename. dry_run returns the files and links that would change, with a "
+        "diff for each, without moving or writing anything; use it first for a folder or a note "
+        "with many links."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_move(source: str, destination: str, create_dirs: bool = True, dry_run: bool = False) -> str:
+    """Move a file or directory."""
+    inp = VaultMoveInput(source=source, destination=destination, create_dirs=create_dirs, dry_run=dry_run)
+    if inp.dry_run:
+        # A dry run writes nothing; don't record it as a mutation.
+        return _vault_move(inp.source, inp.destination, inp.create_dirs, dry_run=True)
+    return run_audited(
+        "vault_move",
+        lambda: _vault_move(inp.source, inp.destination, inp.create_dirs),
+        source=inp.source,
+        destination=inp.destination,
+    )
+
+
+@mcp.tool(
+    name="vault_delete",
+    description=(
+        "Delete a note or folder by moving it to .trash/ in the vault root, like Obsidian's own "
+        "trash; it can be restored from there. A folder goes with everything in it. Requires "
+        "confirm=true. Does NOT hard delete. Only delete what the user asked to delete."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_delete(path: str, confirm: bool = False) -> str:
+    """Delete a file or directory (move to .trash/)."""
+    inp = VaultDeleteInput(path=path, confirm=confirm)
+    return run_audited(
+        "vault_delete",
+        lambda: _vault_delete(inp.path, inp.confirm),
+        path=inp.path,
+    )
+
+
+
+
+
+@mcp.tool(
+    name="vault_daily_note_path",
+    description="Return today's daily-note path (server local date), derived from VAULT_DAILY_NOTES_FOLDER and VAULT_DAILY_NOTES_FORMAT. Does not read or create the file.",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_daily_note_path() -> str:
+    """Resolve today's daily-note path."""
+    return _vault_daily_note_path()
+
+
+@mcp.tool(
+    name="vault_daily_note_read",
+    description="Read today's daily note. Returns an error payload (does not create the note) when it does not exist.",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_daily_note_read() -> str:
+    """Read today's daily note."""
+    return run_audited("vault_daily_note_read", _vault_daily_note_read)
+
+
+@mcp.tool(
+    name="vault_daily_note_append",
+    description="Append content to today's daily note, creating it from VAULT_DAILY_NOTES_TEMPLATE when missing. Token-efficient daily logging without resending the note body.",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_daily_note_append(content: str) -> str:
+    """Append to today's daily note."""
+    inp = VaultDailyNoteAppendInput(content=content)
+    return run_audited(
+        "vault_daily_note_append",
+        lambda: _vault_daily_note_append(inp.content),
+        path=_daily_note_path(_today()),
+    )
+
+
+@mcp.tool(
+    name="vault_analytics_summary",
+    description=(
+        "Return a compact analytics summary for vault hygiene, including frontmatter, link, tag, and encoding "
+        "findings. Read-only; scoped to an optional folder prefix."
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_analytics_summary(
+    path_prefix: str | None = None,
+    required_frontmatter: list[str] | None = None,
+    max_examples: int = 3,
+) -> str:
+    """Return a compact analytics summary for vault hygiene."""
+    inp = VaultAnalyticsSummaryInput(
+        path_prefix=path_prefix,
+        required_frontmatter=required_frontmatter,
+        max_examples=max_examples,
+    )
+    return _vault_analytics_summary(inp.path_prefix or "", inp.required_frontmatter, inp.max_examples)
+
+
+@mcp.tool(
+    name="vault_analytics_findings",
+    description=(
+        "Return detailed findings for one vault analytics category: frontmatter_missing, "
+        "required_frontmatter_missing, broken_wikilinks, suspicious_tag_variants, encoding_issues, "
+        "or oversized_files. Read-only."
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_analytics_findings(
+    category: str,
+    path_prefix: str | None = None,
+    required_frontmatter: list[str] | None = None,
+    max_results: int = 50,
+) -> str:
+    """Return detailed findings for one analytics category."""
+    inp = VaultAnalyticsFindingsInput(
+        category=category,
+        path_prefix=path_prefix,
+        required_frontmatter=required_frontmatter,
+        max_results=max_results,
+    )
+    return _vault_analytics_findings(
+        inp.category,
+        inp.path_prefix or "",
+        inp.required_frontmatter,
+        inp.max_results,
+    )
+
+
+_UPLOAD_CHUNK_LIMIT_MESSAGE = "Uploaded content exceeds the {cap} bytes this upload URL allows"
+
+
+async def direct_upload(request):
+    """Accept the bytes for a signed upload URL.
+
+    The order is the security property. The grant (id, signature, expiry, single use) is
+    validated before a single body byte is read, so a request without a valid URL costs
+    the server nothing. The body is then streamed into a temp file in the upload's
+    staging dir and cut off at the grant's cap; it is never held in memory. The commit
+    checks the grant again, validates size, type and checksum, and places the file.
+
+    Rejected grants are logged, not audited: an unauthenticated flood must not be able
+    to grow the audit log. Every attempt on a valid grant is audited by the commit.
+    """
+    import hashlib
+    import tempfile
+
+    import anyio
+    from starlette.responses import JSONResponse
+
+    upload_id = request.path_params["upload_id"]
+    expires = request.query_params.get("expires", "")
+    signature = request.query_params.get("signature", "")
+
+    grant, status = await anyio.to_thread.run_sync(validate_upload_grant, upload_id, expires, signature)
+    if status != 200:
+        logger.warning("Upload refused before reading the body: %s (%s)", upload_id, grant.get("error"))
+        return JSONResponse(grant, status_code=status)
+
+    cap = min(int(grant["max_size_bytes"]), config.VAULT_UPLOAD_MAX_BYTES)
+    too_large = {"error": _UPLOAD_CHUNK_LIMIT_MESSAGE.format(cap=cap), "upload_id": upload_id}
+    content_type = request.headers.get("content-type", "")
+    if content_type.split(";", 1)[0].strip().lower() == "multipart/form-data":
+        return JSONResponse(
+            {
+                "error": "Send the raw file bytes with the file's Content-Type (curl --data-binary), not multipart",
+                "upload_id": upload_id,
+            },
+            status_code=415,
+        )
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > cap:
+                return JSONResponse(too_large, status_code=413)
+        except ValueError:
+            return JSONResponse({"error": "Invalid Content-Length", "upload_id": upload_id}, status_code=400)
+
+    fd, part_name = tempfile.mkstemp(dir=upload_dir(upload_id), suffix=".part")
+    part = Path(part_name)
+    try:
+        digest = hashlib.sha256()
+        received = 0
+        with open(fd, "wb") as out:
+            async for chunk in request.stream():
+                received += len(chunk)
+                if received > cap:
+                    # Stop at the first chunk past the cap; a missing or understated
+                    # Content-Length buys no more than the grant allows.
+                    return JSONResponse(too_large, status_code=413)
+                digest.update(chunk)
+                await anyio.to_thread.run_sync(out.write, chunk)
+
+        result, status = await anyio.to_thread.run_sync(
+            commit_direct_upload, upload_id, part, digest.hexdigest(), content_type, expires, signature
+        )
+    finally:
+        part.unlink(missing_ok=True)
+
+    if "error" in result:
+        logger.warning("Upload rejected: %s (%s)", upload_id, result["error"])
+    else:
+        logger.info("Upload committed: %s -> %s (%s bytes)", upload_id, result["path"], result["size"])
+    return JSONResponse(result, status_code=status)
+
+
+async def direct_download(request):
+    """Serve the bytes for a signed download URL.
+
+    open_signed_download checks the URL, opens the file once and accepts the handle only
+    if it is the file the URL was issued for; the body streams from that handle, at most
+    the size checked at the open, so a path swapped after the check serves nothing. Only
+    GET reaches this tokenless (auth.py); HEAD, which Starlette adds to every GET route,
+    is refused here.
+
+    The response is always an attachment, never rendered: a vault can hold HTML or SVG,
+    and served inline from this origin it would run next to the OAuth login.
+
+    Refused requests are logged, not audited: an unauthenticated flood must not be able to
+    grow the audit log. A served download is audited as a read when reads are audited.
+    """
+    from urllib.parse import quote
+
+    import anyio
+    from starlette.background import BackgroundTask
+    from starlette.responses import JSONResponse, StreamingResponse
+
+    from .audit import build_audit_record, should_audit_operation, write_audit_record
+
+    if request.method != "GET":
+        return JSONResponse({"error": "Method not allowed"}, status_code=405, headers={"Allow": "GET"})
+
+    download_id = request.path_params["download_id"]
+    grant, status, fd = await anyio.to_thread.run_sync(open_signed_download, download_id, request.query_params)
+    if status != 200:
+        logger.warning("Download refused: %s (%s)", download_id, grant.get("error"))
+        return JSONResponse(grant, status_code=status)
+
+    logger.info("Download served: %s -> %s (%s bytes)", download_id, grant["path"], grant["size"])
+    if should_audit_operation(DOWNLOAD_AUDIT_OPERATION):
+        write_audit_record(
+            build_audit_record(
+                operation=DOWNLOAD_AUDIT_OPERATION,
+                target_path=grant["path"],
+                before={"size": grant["size"], "checksum": None},
+            )
+        )
+
+    closed = False
+
+    def close():
+        nonlocal closed
+        if not closed:
+            closed = True
+            os.close(fd)
+
+    async def body():
+        # Never more than Content-Length: a file that grows after the open would
+        # otherwise break the response.
+        remaining = grant["size"]
+        try:
+            while remaining > 0 and (chunk := await anyio.to_thread.run_sync(read_chunk, fd, min(remaining, 1024 * 1024))):
+                remaining -= len(chunk)
+                yield chunk
+        finally:
+            close()
+
+    filename = grant["filename"]
+    ascii_name = "".join(c if c.isascii() and c.isprintable() and c not in '"\\' else "_" for c in filename)
+    headers = {
+        "Content-Length": str(grant["size"]),
+        "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename, safe='')}",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+        "Cache-Control": "no-store",
+    }
+    return StreamingResponse(body(), media_type=grant["media_type"], headers=headers, background=BackgroundTask(close))
+
+
+class _RedactUploadSignature(logging.Filter):
+    """Keep signed upload and download URLs out of the access log.
+
+    A logged URL is a usable credential until it expires or is used, and a request refused
+    for a wrong Content-Type does not burn the grant. uvicorn's access record carries the
+    full path with query string as an argument; for anything under the upload prefix the
+    whole query string goes, rather than a pattern for "signature=". Matching the literal
+    key was bypassable: Starlette decodes query keys, so %73ignature=<sig> was accepted as
+    the signature and logged in full.
+
+    On any path, the query string also goes when a key decodes to "signature", decoded the
+    way Starlette decodes it. That covers the download route, and a signed URL a client
+    mangles on the way (a doubled slash read as a host, a base URL joined wrong): it still
+    carries a live signature, on a path under neither prefix.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        from urllib.parse import parse_qsl
+
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            target = args[2]
+            path, sep, query = target.partition("?")
+            if sep and (
+                path == config.UPLOAD_ROUTE_PREFIX
+                or path.startswith(config.UPLOAD_ROUTE_PREFIX + "/")
+                or any(key == "signature" for key, _ in parse_qsl(query, keep_blank_values=True))
+            ):
+                record.args = args[:2] + (path + "?REDACTED",) + args[3:]
+        return True
+
+
+def uvicorn_log_config() -> dict:
+    """uvicorn's default logging config plus the signature redaction on the access log."""
+    import copy
+
+    from uvicorn.config import LOGGING_CONFIG
+
+    log_config = copy.deepcopy(LOGGING_CONFIG)
+    log_config.setdefault("filters", {})["redact_upload_signature"] = {"()": _RedactUploadSignature}
+    log_config["handlers"]["access"].setdefault("filters", []).append("redact_upload_signature")
+    return log_config
+
+
+def build_app(extensions=()):
+    """Assemble the authenticated Starlette app served to clients.
+
+    MCP transport + OAuth routes + (off-root only) the unauthenticated spec probe
+    at GET/HEAD / + any extension routes + the bearer-auth middleware. Extracted
+    from main() so the exact composition that serves the vault can be exercised
+    end-to-end in tests, rather than only the validation helper.
+
+    extensions: optional iterable of extensions.Extension instances; each
+    register_routes(app) runs before the auth middleware is attached, so extension
+    routes are bearer-protected. A route that collides with an auth-exempt path is
+    rejected (fail closed) so an extension cannot expose an unauthenticated endpoint.
+    """
+    from starlette.responses import JSONResponse, Response
+    from starlette.routing import Route
+
+    from .auth import BearerAuthMiddleware
+    from .cf_access import CloudflareAccessMiddleware, cf_access_enabled
+    from .oauth import oauth_routes
+
+    cf_on = cf_access_enabled()
+
+    app = mcp.streamable_http_app(
+        stateless_http=True,
+        json_response=True,
+        # Mount path for the MCP transport. Defaults to "/" (via VAULT_MCP_PATH) so
+        # connectors that POST to the root complete the handshake instead of 404ing
+        # (#19); set VAULT_MCP_PATH to host under a prefix like "/mcp".
+        streamable_http_path=VAULT_MCP_PATH,
+        transport_security=TRANSPORT_SECURITY,
+    )
+
+    # MCP spec 2025-06-18 probe: GET/HEAD / answers with the protocol version.
+    # Only mount it when MCP is NOT at root -- otherwise the transport owns
+    # GET/HEAD / and this route would shadow it. (auth.py exempts GET/HEAD /
+    # from bearer auth under the same VAULT_MCP_PATH != "/" guard.)
+    if VAULT_MCP_PATH != "/":
+        async def mcp_root_probe(request):
+            return Response(
+                status_code=200,
+                headers={"MCP-Protocol-Version": "2025-06-18"},
+            )
+
+        app.routes.insert(0, Route("/", mcp_root_probe, methods=["GET", "HEAD"]))
+
+    # Mount OAuth routes (excluded from bearer auth via the middleware) -- but NOT in
+    # Cloudflare Access mode: there, Cloudflare is the sole auth authority, so serving
+    # the app's own OAuth + /.well-known discovery would advertise a second, competing
+    # (unauthenticated-login) surface. Skip them entirely.
+    if not cf_on:
+        for route in oauth_routes:
+            app.routes.insert(0, route)
+
+    # Health endpoint (bearer-exempt, see auth._AUTH_EXEMPT_PATHS). Surfaces audit status
+    # so an operator can confirm the log is enabled and being written.
+    async def health(_request):
+        # Unauthenticated and reachable over the public tunnel, so keep it to liveness:
+        # report only whether auditing is on -- never the log path or write counters,
+        # which would leak the host filesystem layout and a vault-activity side-channel.
+        return JSONResponse({"status": "ok", "audit": {"enabled": audit_enabled()}})
+
+    app.routes.insert(0, Route("/health", health, methods=["GET"]))
+
+    # Extension routes (e.g. a localhost search endpoint), added before the auth
+    # middleware so they are bearer-protected like the MCP transport.
+    #
+    # TRUST MODEL: extensions are fully-trusted, in-process code the operator passes
+    # to serve(). They can do anything the server can (read VAULT_MCP_TOKEN, touch the
+    # vault, mutate any route). This is NOT a sandbox and CANNOT stop a hostile
+    # extension. The check below is a best-effort FOOTGUN guard for honest authors: it
+    # fails closed when a newly-added route would land on an auth-exempt path (which
+    # the bearer middleware skips before routing) and would thus be served
+    # unauthenticated. It does not (and cannot) defend against an extension that
+    # mutates an existing route in place, opens a raw socket, etc.
+    from starlette.routing import Match, Mount, WebSocketRoute
+
+    from .auth import _AUTH_EXEMPT_METHOD_PATHS, _AUTH_EXEMPT_PATHS
+
+    extensions = tuple(extensions)
+    before_ids = {id(r) for r in app.routes}
+    for ext in extensions:
+        ext.register_routes(app)
+    ext_routes = [r for r in app.routes if id(r) not in before_ids]
+
+    def _covers(route, method, path):
+        """Match enum for route vs (method, path); reject uninspectable routes."""
+        try:
+            match, _ = route.matches(
+                {"type": "http", "method": method, "path": path, "headers": []}
+            )
+            return match
+        except Exception as exc:
+            route_path = getattr(route, "path", route)
+            raise ValueError(
+                f"extension route {route_path!r} could not be safely inspected"
+            ) from exc
+
+    for r in ext_routes:
+        # Footguns: a Mount can shadow an exempt prefix; a WebSocketRoute isn't covered
+        # by the HTTP bearer middleware at all. Reject both with a clear error.
+        if isinstance(r, (Mount, WebSocketRoute)):
+            raise ValueError(
+                f"extension {type(r).__name__} is not allowed: it can serve an "
+                "unauthenticated surface -- register plain HTTP Routes instead"
+            )
+        # Method-AGNOSTIC exempt paths: the whole path is unauthenticated, so ANY
+        # coverage (PARTIAL = path matches even if method differs, or FULL) is unsafe.
+        for p in _AUTH_EXEMPT_PATHS:
+            if _covers(r, "GET", p) is not Match.NONE:
+                raise ValueError(
+                    f"extension route {getattr(r, 'path', r)!r} covers auth-exempt path "
+                    f"{p!r}; it would be served without bearer authentication"
+                )
+        # Method-SPECIFIC exempt pairs (e.g. GET/HEAD / probe when off-root): only a
+        # FULL match of that exact method+path is unsafe -- a POST / route is fine.
+        for m, p in _AUTH_EXEMPT_METHOD_PATHS:
+            if _covers(r, m, p) is Match.FULL:
+                raise ValueError(
+                    f"extension route {getattr(r, 'path', r)!r} covers auth-exempt "
+                    f"{m} {p!r}; it would be served without bearer authentication"
+                )
+        # The upload and download namespaces belong to the signed routes. Probes alone
+        # cannot reserve them: a literal Route("/upload/export") matches no probe path, yet
+        # the exemption regex matches its path, so it would be served with neither a token
+        # nor a signature. The declared path is checked directly, and the probes stay for
+        # parameterized and mounted shapes.
+        declared = getattr(r, "path", "") or ""
+        for prefix, method, kind in (
+            (config.UPLOAD_ROUTE_PREFIX, "POST", "upload"),
+            (config.DOWNLOAD_ROUTE_PREFIX, "GET", "download"),
+        ):
+            if declared == prefix or declared.startswith(prefix + "/"):
+                raise ValueError(
+                    f"extension route {declared!r} is under the reserved "
+                    f"{prefix!r} namespace of the signed {kind} route"
+                )
+            for probe in ("", "/probe-id", "/probe-id/deeper"):
+                if _covers(r, method, prefix + probe) is not Match.NONE:
+                    raise ValueError(
+                        f"extension route {getattr(r, 'path', r)!r} is under the reserved "
+                        f"{prefix!r} namespace of the signed {kind} route"
+                    )
+    # The signed routes go in last and at the front, after the extensions. Their exemption
+    # is a family of paths (/upload/<any id>, /download/<any id>), and no probe can show
+    # that an extension route stays out of it: Route("/{area}/export") answers
+    # /download/export. Placed first, a path of the exempt shape always reaches the signed
+    # handler, which refuses it without a valid signature.
+    #
+    # Signed direct upload, only when the operator set VAULT_UPLOAD_URL_SECRET. Without
+    # it the route does not exist and auth.is_signed_upload_request answers False, so an
+    # upgrade adds no unauthenticated write path. Bearer-exempt for exactly
+    # POST /upload/<id>: the HMAC signature in the URL is the authorization.
+    if config.signed_upload_enabled():
+        app.routes.insert(0, Route(f"{config.UPLOAD_ROUTE_PREFIX}/{{upload_id}}", direct_upload, methods=["POST"]))
+
+    # Signed direct download, only when the operator set VAULT_DOWNLOAD_URL_SECRET.
+    # Bearer-exempt for exactly GET /download/<id>, by the same rule as the upload.
+    if config.signed_download_enabled():
+        app.routes.insert(0, Route(f"{config.DOWNLOAD_ROUTE_PREFIX}/{{download_id}}", direct_download, methods=["GET"]))
+
+    # Log why the transport answers 400. Added before the auth middleware, so it sits inside
+    # it and only sees authenticated requests. It logs the transport's own error text and
+    # the protocol-version header, never the request body (that can hold note content).
+    app.add_middleware(_BadRequestLogger)
+
+    # Cloudflare Access mode swaps the static-bearer middleware for CF JWT verification;
+    # the static bearer is never checked in that mode.
+    if cf_on:
+        app.add_middleware(CloudflareAccessMiddleware)
+    else:
+        app.add_middleware(BearerAuthMiddleware)
+    return app
+
+
+class _BadRequestLogger:
+    """ASGI middleware: log the reason for every 400 the MCP transport returns."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        state = {"status": None, "body": b""}
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                state["status"] = message["status"]
+            elif message["type"] == "http.response.body" and state["status"] == 400:
+                state["body"] += message.get("body", b"")[:500]
+                if not message.get("more_body"):
+                    logger.warning(
+                        "400 on %s %s (mcp-protocol-version=%r, content-type=%r, accept=%r): %s",
+                        scope.get("method"), scope.get("path"),
+                        headers.get("mcp-protocol-version"), headers.get("content-type"),
+                        headers.get("accept"), state["body"][:500].decode("utf-8", "replace"),
+                    )
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+def main():
+    """Console-script entry point: run the stock server with no extensions."""
+    serve()
+
+
+def serve(extensions=()):
+    """Run the server with the streamable HTTP transport.
+
+    extensions: optional iterable of extensions.Extension instances. A custom
+    deployment calls serve([MyExtension()]) from its own entry point to add tools,
+    routes, and index hooks without forking this module. With no extensions the
+    behavior is identical to the stock server.
+    """
+    extensions = tuple(extensions)  # consumed multiple times; never a generator
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+    if not VAULT_PATH.is_dir():
+        logger.error(f"Vault path does not exist: {VAULT_PATH}")
+        sys.exit(1)
+
+    # Validate operator config before serving; fail CLOSED on a bad value.
+    try:
+        from .config import validate_config
+        validate_config()
+    except ValueError as e:
+        logger.error(f"Invalid configuration: {e}")
+        sys.exit(1)
+
+    # Cloudflare Access mode: fail CLOSED on missing deps, warm the key set, and (below)
+    # suppress the static-token warning that is irrelevant when Cloudflare is the auth
+    # authority. A half-configured pair (exactly one of the two settings) fails startup
+    # in validate_config(), so this point is only reached with the mode fully on or off.
+    from .cf_access import (
+        cf_access_enabled,
+        require_dependencies,
+        team_domain,
+        warm_jwks,
+    )
+
+    cf_on = cf_access_enabled()
+    if cf_on:
+        try:
+            require_dependencies()
+        except Exception as e:
+            logger.error(str(e))
+            sys.exit(1)
+        logger.info("Cloudflare Access mode ENABLED (team: %s)", team_domain())
+        warm_jwks()
+
+    if not cf_on and not VAULT_MCP_TOKEN:
+        logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
+
+    # Semantic search is opt-in: fail CLOSED without its extra; while off, import nothing of it.
+    if config.semantic_search_enabled():
+        from .semantic import require_dependencies
+        try:
+            require_dependencies()
+        except Exception as e:
+            logger.error(str(e))
+            sys.exit(1)
+        from .semantic.extension import SemanticExtension
+        extensions = (SemanticExtension(), *extensions)
+
+    # Open the OAuth store before serving, so the legacy registry import and the file
+    # modes happen at startup rather than on the first request. Not in Cloudflare Access
+    # mode: no OAuth route or bearer check is mounted there, so it would only leave files
+    # behind. Fail CLOSED: an OAuth server that cannot keep its clients must not start.
+    if not cf_on:
+        from .oauth import close_oauth_state, get_oauth_state
+        try:
+            get_oauth_state()
+        except Exception as e:
+            logger.error(f"Could not open the OAuth state: {e}")
+            sys.exit(1)
+        atexit.register(close_oauth_state)
+
+    # Fail CLOSED on a misconfigured audit log: if auditing is requested but the log path
+    # is not writable, refuse to start rather than silently dropping mutation records.
+    if audit_enabled() and not audit_path_writable():
+        logger.error(f"VAULT_AUDIT_LOG_PATH is not writable: {audit_log_path()}")
+        sys.exit(1)
+    # Fail CLOSED on an audit log that resolves inside the vault: the vault tools could
+    # then overwrite or delete it, defeating the append-only integrity premise.
+    if audit_enabled() and audit_path_inside_vault():
+        logger.error(
+            f"VAULT_AUDIT_LOG_PATH resolves inside the vault ({audit_log_path()}); "
+            "the vault tools could rewrite it. Choose a path outside VAULT_PATH."
+        )
+        sys.exit(1)
+    if audit_enabled():
+        logger.info(
+            "Audit log enabled: %s (reads included: %s)",
+            audit_log_path(),
+            VAULT_AUDIT_LOG_INCLUDE_READS,
+        )
+
+    # Extension setup: register tools BEFORE the app/tool-schema is built, and let
+    # each extension prepare before the frontmatter index starts (e.g. attach a
+    # change listener so no change is missed between build and listener attach).
+    for ext in extensions:
+        ext.register_tools(mcp)
+        ext.before_indexes_start(frontmatter_index)
+
+    # Build the frontmatter index ONCE, before serving. With stateless_http the
+    # per-request MCP lifespan would otherwise rebuild it on every request (#28).
+    logger.info(f"Starting vault MCP server. Vault: {VAULT_PATH}")
+    frontmatter_index.start()
+    atexit.register(frontmatter_index.stop)
+
+    # After the index is built and watching: extensions can start dependent work
+    # (e.g. a reconcile loop). shutdown() is registered last so atexit (LIFO) runs
+    # it BEFORE frontmatter_index.stop().
+    for ext in extensions:
+        ext.after_indexes_start(frontmatter_index)
+        atexit.register(ext.shutdown)
+
+    # Optional liveness heartbeat. Daemon thread tied to the process (not the
+    # per-request lifespan), started only when configured. Validated here so a bad
+    # URL scheme or interval fails CLOSED instead of booting silently broken.
+    try:
+        from .config import validate_heartbeat
+        heartbeat_interval = validate_heartbeat()
+    except ValueError as e:
+        logger.error(f"Invalid heartbeat configuration: {e}")
+        sys.exit(1)
+    if heartbeat_interval is not None:
+        threading.Thread(
+            target=_heartbeat_forever,
+            args=(VAULT_MCP_HEARTBEAT_URL, heartbeat_interval),
+            daemon=True,
+            name="heartbeat",
+        ).start()
+        logger.info("Heartbeat enabled (interval: %ds)", heartbeat_interval)
+
+    # Build the Starlette app with auth middleware and OAuth endpoints
+    try:
+        app = build_app(extensions)
+        _auth_mode = "Cloudflare Access" if cf_on else "bearer auth + OAuth"
+        logger.info(
+            f"Starting server on {VAULT_MCP_HOST}:{VAULT_MCP_PORT} with {_auth_mode}"
+        )
+    except Exception as e:
+        # Fail CLOSED: never fall back to an unauthenticated server.
+        logger.error(f"Could not build the authenticated app: {e}")
+        sys.exit(1)
+
+    import uvicorn
+    uvicorn.run(
+        app,
+        host=VAULT_MCP_HOST,
+        port=VAULT_MCP_PORT,
+        log_level="info",
+        log_config=uvicorn_log_config(),
+        # Honor X-Forwarded-* ONLY from the trusted loopback proxy (Cloudflare
+        # Tunnel / Caddy), never from arbitrary clients. Trusting "*" let any
+        # caller spoof the advertised OAuth origin via X-Forwarded-Host.
+        proxy_headers=True,
+        forwarded_allow_ips=VAULT_MCP_FORWARDED_ALLOW_IPS,
+    )
+
+
+if __name__ == "__main__":
+    main()

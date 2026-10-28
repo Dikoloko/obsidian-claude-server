@@ -1,0 +1,12 @@
+# Copy to %USERPROFILE%\.cloudflared\config.yml and fill in the tunnel id and your user name.
+# One tunnel for all vaults; every hostname goes to its own server, the rest gets a 404.
+tunnel: <tunnel-id>
+credentials-file: C:\Users\<jij>\.cloudflared\<tunnel-id>.json
+
+ingress:
+  - hostname: a.jouwdomein.com
+    service: http://127.0.0.1:8421
+  # A second vault gets its own hostname and port:
+  # - hostname: b.jouwdomein.com
+  #   service: http://127.0.0.1:8422
+  - service: http_status:404

@@ -1,0 +1,157 @@
+"""Bearer token authentication middleware for the vault MCP server."""
+
+import hmac
+import re
+import uuid
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+from . import config
+from .config import VAULT_MCP_TOKEN
+from .context import reset_request_context, set_request_context
+from .oauth import canonical_resource, get_oauth_state, resource_matches
+from .oauth_state import TokenMetadata
+
+# Paths that don't require bearer auth (OAuth flow + health)
+_AUTH_EXEMPT_PATHS = {
+    "/health",
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/oauth-protected-resource",
+    "/oauth/authorize",
+    "/oauth/token",
+    "/oauth/register",
+}
+
+# (method, path) pairs exempt from auth. The MCP spec 2025-06-18 probe on / must
+# answer GET/HEAD without credentials. This is ONLY active when MCP is mounted off
+# root (VAULT_MCP_PATH != "/"); when MCP is at root the transport owns GET/HEAD /
+# and must stay fully authenticated, so the set is empty and behaviour is unchanged.
+_AUTH_EXEMPT_METHOD_PATHS = (
+    {("GET", "/"), ("HEAD", "/")} if config.VAULT_MCP_PATH != "/" else set()
+)
+
+# The signed direct upload is the one exemption that is neither a fixed path nor a
+# probe: POST to exactly one id segment under /upload. The id alphabet and the single
+# segment are part of the rule, so /upload, /upload/a/b, or a GET on an upload URL all
+# still need a bearer token. The URL's HMAC signature is the authorization; the route
+# validates it before reading any body bytes.
+_SIGNED_UPLOAD_PATH = re.compile(r"/upload/[A-Za-z0-9-]{1,64}")
+
+
+def is_signed_upload_request(method: str, path: str) -> bool:
+    """Whether this is the one request shape the signed upload route serves tokenless.
+
+    False whenever the feature is off, so a server without VAULT_UPLOAD_URL_SECRET has no
+    bearer-exempt write path at all.
+    """
+    if not config.signed_upload_enabled():
+        return False
+    return method == "POST" and _SIGNED_UPLOAD_PATH.fullmatch(path) is not None
+
+
+# The signed download, by the same rule: GET to exactly one id segment under /download.
+# HEAD, /download/a/b and /download itself still need a bearer token.
+_SIGNED_DOWNLOAD_PATH = re.compile(r"/download/[A-Za-z0-9-]{1,64}")
+
+
+def is_signed_download_request(method: str, path: str) -> bool:
+    """Whether this is the one request shape the signed download route serves tokenless.
+
+    False whenever the feature is off, so a server without VAULT_DOWNLOAD_URL_SECRET has no
+    bearer-exempt read path at all.
+    """
+    if not config.signed_download_enabled():
+        return False
+    return method == "GET" and _SIGNED_DOWNLOAD_PATH.fullmatch(path) is not None
+
+
+def _www_authenticate(request: Request, error: str) -> str:
+    """RFC 9728 challenge header pointing clients at the protected-resource metadata.
+
+    Without it a 401 just looks like a failed request; with it, a spec-compliant MCP
+    client (e.g. Claude Code, ChatGPT) knows to fetch the metadata and start the OAuth
+    flow -- "Needs authentication" instead of "Failed to connect". The resource URL is
+    derived from VAULT_MCP_PUBLIC_URL when set (otherwise request.base_url), matching the
+    oauth_metadata / oauth_protected_resource endpoints. Pinning the public URL keeps a
+    spoofed Host/X-Forwarded-Host header from pointing clients at an attacker's server.
+    """
+    base_url = config.advertised_base_url(str(request.base_url))
+    resource_metadata = f"{base_url}/.well-known/oauth-protected-resource"
+    return f'Bearer realm="mcp", resource_metadata="{resource_metadata}", error="{error}"'
+
+
+def _per_client_token(request: Request, token: str) -> TokenMetadata | None:
+    """A usable per-client OAuth token issued for this MCP endpoint, otherwise None."""
+    issued = get_oauth_state().lookup_access_token(token)
+    if issued is None or not resource_matches(issued.resource, canonical_resource(request)):
+        return None
+    return issued
+
+
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Validates Bearer tokens on all requests except OAuth and health endpoints."""
+
+    async def dispatch(self, request: Request, call_next):
+        # The decoded ASGI path, not request.url.path. The latter is parsed back out of a
+        # URL string, so an encoded "?" or "#" truncates it: "/health%3F/x" would read as
+        # the exempt "/health" here while the router dispatched "/health?/x".
+        path = request.scope["path"]
+
+        if path in _AUTH_EXEMPT_PATHS:
+            return await call_next(request)
+
+        if (request.method, path) in _AUTH_EXEMPT_METHOD_PATHS:
+            return await call_next(request)
+
+        if is_signed_upload_request(request.method, path):
+            return await call_next(request)
+
+        if is_signed_download_request(request.method, path):
+            return await call_next(request)
+
+        if not VAULT_MCP_TOKEN:
+            return JSONResponse(
+                {"error": "Server misconfigured: no auth token set"},
+                status_code=500,
+            )
+
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse(
+                {"error": "Missing or malformed Authorization header"},
+                status_code=401,
+                headers={"WWW-Authenticate": _www_authenticate(request, "invalid_request")},
+            )
+
+        token = auth_header[7:]
+        # Constant-time compare: avoid leaking the token via response timing (#2). Bytes,
+        # because hmac.compare_digest raises on str that is not ASCII.
+        if hmac.compare_digest(token.encode(), VAULT_MCP_TOKEN.encode()):
+            # The static bearer names no client: a User-Agent-derived hint stands in. It is
+            # the operator's own token, so it always has full access.
+            client = request.headers.get("user-agent", "").strip()[:200] or None
+            access = "write"
+        elif (issued := _per_client_token(request, token)) is not None:
+            # Looked up on every request, so a changed access level applies to the next one.
+            client = issued.client_id
+            access = issued.access
+        else:
+            # One answer for every refused token, so it does not tell which kind failed.
+            return JSONResponse(
+                {"error": "Invalid token"},
+                status_code=401,
+                headers={"WWW-Authenticate": _www_authenticate(request, "invalid_token")},
+            )
+
+        # Thread the authenticated principal (plus a request id and the client) to the tool
+        # layer for the audit log. The raw token never leaves this context;
+        # audit.build_audit_record stores only its SHA-256 hash.
+        ctx_token = set_request_context(
+            principal=token, request_id=uuid.uuid4().hex, client=client, access=access
+        )
+        try:
+            return await call_next(request)
+        finally:
+            reset_request_context(ctx_token)

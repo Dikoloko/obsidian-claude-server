@@ -1,0 +1,478 @@
+import json
+import os
+import re
+from pathlib import Path
+
+# Vault configuration
+VAULT_PATH = Path(os.environ.get("VAULT_PATH", os.path.expanduser("~/Obsidian/MyVault")))
+VAULT_MCP_TOKEN = os.environ.get("VAULT_MCP_TOKEN", "")
+VAULT_MCP_PORT = int(os.environ.get("VAULT_MCP_PORT", "8420"))
+
+# Daily-note tools. FOLDER "" means the vault root; FORMAT/TEMPLATE are strftime
+# patterns. All optional with safe defaults; resolved paths still go through
+# resolve_vault_path.
+VAULT_DAILY_NOTES_FOLDER = os.environ.get("VAULT_DAILY_NOTES_FOLDER", "")
+VAULT_DAILY_NOTES_FORMAT = os.environ.get("VAULT_DAILY_NOTES_FORMAT", "%Y-%m-%d").strip() or "%Y-%m-%d"
+VAULT_DAILY_NOTES_TEMPLATE = os.environ.get("VAULT_DAILY_NOTES_TEMPLATE", "")
+
+# HTTP path the MCP transport is mounted at. Defaults to "/" so connectors that
+# POST to the root complete the handshake (#19) -- changing this default would
+# break that, so leave it unless you deliberately host under a path prefix.
+# Setting it (e.g. "/mcp") lets the server live alongside other services on one
+# hostname behind a reverse proxy that cannot rewrite paths (Cloudflare Tunnel).
+# Validated in validate_config(): must be absolute and must not collide with an
+# auth-exempt path, or it would serve the vault on an unauthenticated route.
+VAULT_MCP_PATH = os.environ.get("VAULT_MCP_PATH", "/")
+
+# OAuth 2.0 client credentials (for Claude app integration)
+VAULT_OAUTH_CLIENT_ID = os.environ.get("VAULT_OAUTH_CLIENT_ID", "vault-mcp-client")
+VAULT_OAUTH_CLIENT_SECRET = os.environ.get("VAULT_OAUTH_CLIENT_SECRET", "")
+
+# Interactive login gate on /oauth/authorize. The OAuth browser step authenticates
+# the *human* before any authorization code is issued. Without this, anyone who can
+# reach the URL can complete the flow and obtain a vault token (see issues #8/#29).
+# The password is required on every authorization, so there is no ambient session
+# cookie for a cross-site request to ride on.
+VAULT_OAUTH_USERNAME = os.environ.get("VAULT_OAUTH_USERNAME", "obsidian")
+VAULT_OAUTH_PASSWORD = os.environ.get("VAULT_OAUTH_PASSWORD", "")
+
+# Allowed redirect URIs for the operator-configured client (VAULT_OAUTH_CLIENT_ID),
+# comma-separated. Dynamically-registered clients carry their own redirect_uris; this
+# governs only the static operator client. If empty, the operator client cannot use the
+# browser authorization-code flow (it can still use the client_credentials grant).
+VAULT_OAUTH_REDIRECT_URIS = [u.strip() for u in os.environ.get("VAULT_OAUTH_REDIRECT_URIS", "").split(",") if u.strip()]
+
+# The legacy JSON registry of dynamically-registered OAuth clients. OAuth state now lives
+# in oauth_state.sqlite3 beside it, which imports this file on every open and never writes
+# it (see oauth_state.py); clients therefore keep working across restarts and upgrades.
+# The directory holds per-client secret hashes and tokens, so it is kept 0700 and the
+# files 0600. Override with OAUTH_CLIENTS_PATH.
+OAUTH_CLIENTS_PATH = Path(os.environ.get(
+    "OAUTH_CLIENTS_PATH",
+    Path.home() / ".local" / "share" / "vault-mcp" / "oauth_clients.json",
+))
+
+# Network bind address. Defaults to loopback so the server is NOT exposed on the LAN;
+# Cloudflare Tunnel reaches it over localhost. Set to 0.0.0.0 only if you deliberately
+# want direct network exposure.
+VAULT_MCP_HOST = os.environ.get("VAULT_MCP_HOST", "127.0.0.1")
+
+# Extra hostnames allowed through the MCP library's DNS-rebinding protection,
+# comma-separated. Loopback (127.0.0.1, localhost, [::1]) is always allowed; set this
+# to your public tunnel/proxy hostname, e.g. "vault-mcp.example.com". Operator-supplied
+# hosts are APPENDED to the loopback defaults in server.py, never replace them.
+VAULT_MCP_ALLOWED_HOSTS = [h.strip() for h in os.environ.get("VAULT_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+
+# Which client IPs uvicorn trusts to set X-Forwarded-* headers. Because the server
+# derives request.base_url from those headers and advertises it in OAuth discovery
+# metadata + the RFC 9728 WWW-Authenticate challenge, trusting them from arbitrary
+# sources lets an attacker spoof the advertised authorization-server / resource URL
+# (X-Forwarded-Host: evil.example) -- a token-redirection vector. The server binds
+# loopback and is reached by Cloudflare Tunnel / Caddy over localhost, so the only
+# trustworthy forwarder is loopback. Defaults to uvicorn's own default, "127.0.0.1";
+# override only if your reverse proxy connects from a different address (e.g. "::1").
+# Never set this to "*".
+VAULT_MCP_FORWARDED_ALLOW_IPS = os.environ.get("VAULT_MCP_FORWARDED_ALLOW_IPS", "127.0.0.1")
+
+# Canonical public origin for every URL the server advertises -- the OAuth metadata
+# endpoints (issuer / authorization_endpoint / token_endpoint / registration_endpoint /
+# resource) and the WWW-Authenticate resource_metadata pointer. When set (e.g.
+# "https://vault-mcp.example.com") it PINS those URLs so a spoofed Host / X-Forwarded-Host
+# header cannot redirect OAuth discovery to an attacker-controlled server. When empty,
+# the server falls back to the per-request base_url. A trailing slash is ignored.
+VAULT_MCP_PUBLIC_URL = os.environ.get("VAULT_MCP_PUBLIC_URL", "").strip()
+
+# --- Cloudflare Access (optional, opt-in) ------------------------------------------
+# When BOTH of these are set, the server runs in "Cloudflare Access" mode: it trusts
+# Cloudflare to authenticate the caller at its edge (per-identity SSO / one-time-PIN)
+# and verifies the signed Cf-Access-Jwt-Assertion header Cloudflare injects on every
+# request forwarded through the tunnel. When either is empty the mode is OFF and
+# behaviour is identical to today (the app's own OAuth + static bearer). Both-or-neither,
+# mirroring the sibling telegram-catcher deployment.
+#   TEAM_DOMAIN: the Cloudflare team domain, e.g. "myteam.cloudflareaccess.com" (a bare
+#     "myteam" or a full URL is normalized in cf_access.team_domain()).
+#   AUD: the Access application audience (AUD) tag from the Cloudflare dashboard.
+VAULT_MCP_CF_ACCESS_TEAM_DOMAIN = os.environ.get("VAULT_MCP_CF_ACCESS_TEAM_DOMAIN", "").strip()
+VAULT_MCP_CF_ACCESS_AUD = os.environ.get("VAULT_MCP_CF_ACCESS_AUD", "").strip()
+
+
+def advertised_base_url(request_base_url: str) -> str:
+    """Return the canonical origin to advertise, with no trailing slash.
+
+    Prefers the operator-pinned VAULT_MCP_PUBLIC_URL; falls back to the request's
+    own base_url. Centralizing this keeps the OAuth metadata endpoints and the
+    WWW-Authenticate challenge consistent and spoof-resistant.
+    """
+    return (VAULT_MCP_PUBLIC_URL or request_base_url).rstrip("/")
+
+# Optional liveness heartbeat. When VAULT_MCP_HEARTBEAT_URL is set, the server GETs
+# it every VAULT_MCP_HEARTBEAT_INTERVAL seconds from a daemon thread, for push-style
+# uptime monitors (Uptime Kuma, Healthchecks.io, Cronitor, ...). Empty = disabled
+# (the default); failures are logged, never fatal. The interval is kept as a raw
+# string and parsed in validate_heartbeat() so a bad value fails closed at startup
+# rather than crashing the whole server at import time.
+VAULT_MCP_HEARTBEAT_URL = os.environ.get("VAULT_MCP_HEARTBEAT_URL", "").strip()
+VAULT_MCP_HEARTBEAT_INTERVAL = os.environ.get("VAULT_MCP_HEARTBEAT_INTERVAL", "60").strip()
+
+
+def validate_heartbeat() -> int | None:
+    """Validate the heartbeat config; return the interval (seconds) when enabled.
+
+    Returns None when the heartbeat is disabled (no URL). Raises ValueError (so
+    server.main() can exit non-zero and fail CLOSED) when the URL scheme is not
+    http(s) or the interval is not a positive integer -- a typo must not boot a
+    server that silently never pings, or that tight-loops on interval 0.
+    """
+    url = VAULT_MCP_HEARTBEAT_URL
+    if not url:
+        return None
+
+    from urllib.parse import urlsplit
+
+    # The error messages below deliberately never echo the raw values: the URL is a
+    # capability URL (secret in the path), and a misconfigured operator might swap the
+    # URL/interval env vars -- and server.main() logs whatever this raises.
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port  # raises ValueError on a malformed port
+    except ValueError:
+        raise ValueError("VAULT_MCP_HEARTBEAT_URL has a malformed port")
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError("VAULT_MCP_HEARTBEAT_URL must be an http(s) URL with a host")
+    del port  # only accessed to trigger the malformed-port check
+
+    try:
+        interval = int(VAULT_MCP_HEARTBEAT_INTERVAL)
+    except ValueError:
+        raise ValueError(
+            "VAULT_MCP_HEARTBEAT_INTERVAL must be an integer number of seconds"
+        )
+    if interval <= 0:
+        raise ValueError("VAULT_MCP_HEARTBEAT_INTERVAL must be a positive integer")
+    return interval
+
+
+# Append-only JSONL audit log of vault mutations. When VAULT_AUDIT_LOG_PATH is set,
+# every mutation appends one JSON record (UTC timestamp, SHA-256 hash of the bearer
+# token, operation, target path, size + checksum before and after). Empty (the default)
+# disables auditing entirely. The raw bearer token is never written -- only its SHA-256
+# hash. The path is validated as writable at startup; an unwritable path fails the
+# server closed (see server.main) rather than dropping records silently.
+VAULT_AUDIT_LOG_PATH = os.environ.get("VAULT_AUDIT_LOG_PATH", "").strip()
+
+# Also record read/search operations (opt-in). Off by default because reads are
+# high-volume and may carry privacy weight; mutations are always logged once the audit
+# log is enabled. Accepts 1/true/yes/on (case-insensitive).
+VAULT_AUDIT_LOG_INCLUDE_READS = os.environ.get(
+    "VAULT_AUDIT_LOG_INCLUDE_READS", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
+# Semantic search (opt-in; needs the `semantic` extra). The index holds an excerpt of every
+# note, so it must resolve outside the vault. Both settings are checked in validate_config().
+VAULT_SEMANTIC_SEARCH = os.environ.get("VAULT_SEMANTIC_SEARCH", "").strip()
+VAULT_SEMANTIC_DB_PATH = Path(os.environ.get(
+    "VAULT_SEMANTIC_DB_PATH",
+    Path.home() / ".local" / "share" / "vault-mcp" / "embeddings.db",
+))
+
+
+def semantic_search_enabled() -> bool:
+    """Whether the operator switched on vault_semantic_search."""
+    return VAULT_SEMANTIC_SEARCH.lower() in {"1", "true", "yes", "on"}
+
+
+# Safety limits
+MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
+MAX_BINARY_SIZE = 10_000_000  # 10MB max binary write size (images/PDFs run larger than text)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+# Signed direct upload (POST /upload/{id}). The route is bearer-exempt because the HMAC
+# signature in the URL is the authorization: single-use, short-lived, constant-time
+# compared, and checked before a single body byte is read. The body is streamed to a
+# temp file under the staging dir (outside the vault), so its cap is a disk bound, not a
+# memory bound, and can sit above MAX_BINARY_SIZE: this path exists for files too large
+# to travel base64-encoded through an MCP tool argument (vault_write_binary).
+VAULT_UPLOAD_URL_SECRET = os.environ.get("VAULT_UPLOAD_URL_SECRET", "").strip()
+VAULT_UPLOAD_URL_TTL_SECONDS = _env_int("VAULT_UPLOAD_URL_TTL_SECONDS", 900)
+VAULT_UPLOAD_URL_MAX_TTL_SECONDS = _env_int("VAULT_UPLOAD_URL_MAX_TTL_SECONDS", 3600)
+VAULT_UPLOAD_MAX_BYTES = _env_int("VAULT_UPLOAD_MAX_BYTES", 100_000_000)
+UPLOAD_STAGING_DIR = Path(os.environ.get(
+    "VAULT_UPLOAD_STAGING_DIR",
+    Path.home() / ".local" / "share" / "vault-mcp" / "uploads",
+))
+# The one path the upload route owns. Reserved in _validate_mcp_path and closed to
+# extension routes in build_app, so nothing else can be mounted under it.
+UPLOAD_ROUTE_PREFIX = "/upload"
+
+
+def signed_upload_enabled() -> bool:
+    """Whether the signed upload path exists at all.
+
+    Off unless the operator sets VAULT_UPLOAD_URL_SECRET. There is deliberately no
+    fallback to VAULT_MCP_TOKEN: upgrading must not turn on a new unauthenticated write
+    path, and the bearer token should not double as the URL-signing key.
+
+    This fork never enables it: no unauthenticated write route, whatever the env says.
+    """
+    return False
+
+
+# Signed direct download (GET /download/{id}), the read counterpart of the signed upload.
+# Bearer-exempt for the same reason: the HMAC signature in the URL is the authorization.
+# The URL carries the whole grant (path, file identity, expiry); the server keeps no state.
+# The route opens the file once and serves only if it is the file the URL names.
+VAULT_DOWNLOAD_URL_SECRET = os.environ.get("VAULT_DOWNLOAD_URL_SECRET", "").strip()
+VAULT_DOWNLOAD_URL_TTL_SECONDS = _env_int("VAULT_DOWNLOAD_URL_TTL_SECONDS", 300)
+VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS = _env_int("VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS", 3600)
+# Reserved like UPLOAD_ROUTE_PREFIX, whether or not the feature is on.
+DOWNLOAD_ROUTE_PREFIX = "/download"
+
+
+def signed_download_enabled() -> bool:
+    """Whether the signed download path exists at all.
+
+    Off unless the operator sets VAULT_DOWNLOAD_URL_SECRET. No fallback to the upload
+    secret or VAULT_MCP_TOKEN: an upgrade must not open a tokenless read path, and turning
+    on uploads must not turn on downloads.
+
+    This fork never enables it: no tokenless read route, whatever the env says.
+    """
+    return False
+
+
+MAX_BATCH_SIZE = 20           # Max files per batch operation
+MAX_SEARCH_RESULTS = 50       # Max results per search
+DEFAULT_SEARCH_RESULTS = 20
+MAX_LIST_DEPTH = 5            # Max directory recursion depth
+CONTEXT_LINES = 2             # Default lines of context in search results
+
+# Directories to never expose or modify
+EXCLUDED_DIRS = {".obsidian", ".trash", ".git", ".claude", ".DS_Store"}
+
+# The only file types a text write (write, edit, append) may create or change.
+TEXT_WRITE_EXTENSIONS = frozenset({".md", ".canvas"})
+
+# Frontmatter index refresh interval (seconds)
+FRONTMATTER_INDEX_DEBOUNCE = 5.0
+
+
+def _validate_mcp_path(path: str) -> None:
+    """Reject a VAULT_MCP_PATH that is malformed or would expose the vault unauthenticated.
+
+    The MCP transport mounts at exactly this path. The default "/" keeps behaviour
+    byte-identical and is always valid. Any other value must be an absolute, clean
+    path that does NOT land on (or under) an authentication-exempt route -- otherwise
+    the bearer middleware would wave the vault transport through without a token.
+    """
+    if path == "/":
+        return
+    if not path.startswith("/"):
+        raise ValueError(
+            f"VAULT_MCP_PATH must be an absolute path starting with '/': {path!r}"
+        )
+    if path.endswith("/"):
+        raise ValueError(
+            f"VAULT_MCP_PATH must not end with a trailing slash: {path!r}"
+        )
+    if "?" in path or "#" in path or "//" in path:
+        raise ValueError(
+            "VAULT_MCP_PATH must be a clean path with no query string, fragment, "
+            f"or empty segments: {path!r}"
+        )
+    if "%" in path or any(c.isspace() or ord(c) < 0x20 for c in path):
+        raise ValueError(
+            "VAULT_MCP_PATH must not contain percent-encoding, whitespace, or "
+            f"control characters: {path!r}"
+        )
+    if any(seg in (".", "..") for seg in path.strip("/").split("/")):
+        raise ValueError(
+            f"VAULT_MCP_PATH must not contain '.' or '..' path segments: {path!r}"
+        )
+    # Imported lazily: auth imports config, so a top-level import here would cycle.
+    from .auth import _AUTH_EXEMPT_PATHS
+
+    reserved_prefixes = ("/oauth", "/.well-known", UPLOAD_ROUTE_PREFIX, DOWNLOAD_ROUTE_PREFIX)
+    collides = path in _AUTH_EXEMPT_PATHS or any(
+        path == prefix or path.startswith(prefix + "/") for prefix in reserved_prefixes
+    )
+    if collides:
+        raise ValueError(
+            f"VAULT_MCP_PATH {path!r} collides with an authentication-exempt route; "
+            "mounting there would serve the vault without auth. Choose a path that is "
+            "not /health and not under /oauth, /.well-known, /upload or /download."
+        )
+
+
+# Extra binary media types (#100). Which file types a vault accepts through
+# vault_write_binary and the signed upload is the operator's call: a JSON object mapping a
+# media type to its extensions, e.g.
+#   {"application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"]}
+# It only ever adds to the built-in allowlist (tools/write.py), never replaces it. Parsed
+# leniently here (a bad value means no extras) and strictly in validate_config(), which
+# stops startup with the variable's name.
+VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON = os.environ.get("VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON", "").strip()
+
+# Extensions a binary write must never target: the text formats the other write tools own
+# (a note, a canvas, a base), so no configuration can point a binary write at a note path;
+# and SVG, excluded from the built-in list on purpose because it can carry active content.
+REFUSED_EXTRA_BINARY_EXTENSIONS = frozenset({".md", ".markdown", ".canvas", ".base", ".txt", ".svg"})
+
+_MEDIA_TYPE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*")
+_EXTENSION = re.compile(r"\.[a-z0-9][a-z0-9_-]*")
+
+
+def parse_extra_binary_media_types(raw: str) -> dict[str, frozenset[str]]:
+    """Parse VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON; raise ValueError naming what is wrong."""
+    name = "VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON"
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise ValueError(f"{name} is not valid JSON: {e}")
+    if not isinstance(data, dict):
+        raise ValueError(f"{name} must be a JSON object mapping a media type to a list of extensions")
+    parsed: dict[str, frozenset[str]] = {}
+    for media_type, extensions in data.items():
+        normalized_type = media_type.strip().lower()
+        if not _MEDIA_TYPE.fullmatch(normalized_type):
+            raise ValueError(f"{name}: {media_type!r} is not a media type of the form type/subtype")
+        if not isinstance(extensions, list) or not extensions:
+            raise ValueError(f"{name}: the value for {media_type!r} must be a non-empty list of extensions")
+        normalized = set()
+        for extension in extensions:
+            ext = extension.strip().lower() if isinstance(extension, str) else ""
+            if not _EXTENSION.fullmatch(ext):
+                raise ValueError(
+                    f"{name}: {extension!r} for {media_type!r} is not an extension; "
+                    "use a leading dot, e.g. '.docx'"
+                )
+            if ext in REFUSED_EXTRA_BINARY_EXTENSIONS:
+                raise ValueError(
+                    f"{name}: {ext} cannot be a binary type; it is a text format the write tools "
+                    "own, or excluded on purpose (.svg can carry active content)"
+                )
+            normalized.add(ext)
+        parsed[normalized_type] = frozenset(normalized)
+    return parsed
+
+
+try:
+    EXTRA_BINARY_MEDIA_TYPES = parse_extra_binary_media_types(VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON)
+except ValueError:
+    EXTRA_BINARY_MEDIA_TYPES = {}  # validate_config() refuses to start with this value
+
+
+def validate_config() -> None:
+    """Validate operator-supplied configuration at startup.
+
+    Called from server.main() before the server is built, so a bad value fails
+    CLOSED with a clear message instead of booting a broken or insecure server.
+    """
+    _validate_mcp_path(VAULT_MCP_PATH)
+    parse_extra_binary_media_types(os.environ.get("VAULT_EXTRA_BINARY_MEDIA_TYPES_JSON", "").strip())
+    if signed_upload_enabled():
+        _validate_upload_settings()
+    _validate_semantic_settings()
+    if signed_download_enabled():
+        _validate_download_settings()
+    # Imported lazily: cf_access imports config, so a top-level import here would cycle.
+    # A no-op unless Cloudflare Access mode is on (both settings set).
+    from .cf_access import validate_cf_access_config
+    validate_cf_access_config()
+
+
+def _validate_upload_settings() -> None:
+    """Fail closed on the signed-upload settings, the way the heartbeat interval does.
+
+    The module-level parses fall back to the default on a bad value, which would silently
+    ignore VAULT_UPLOAD_MAX_BYTES=100MB. Here the raw environment is read again so a
+    typo, a non-positive value, or a staging directory inside the vault stops startup
+    with the variable's name.
+    """
+    for name, parsed in (
+        ("VAULT_UPLOAD_URL_TTL_SECONDS", VAULT_UPLOAD_URL_TTL_SECONDS),
+        ("VAULT_UPLOAD_URL_MAX_TTL_SECONDS", VAULT_UPLOAD_URL_MAX_TTL_SECONDS),
+        ("VAULT_UPLOAD_MAX_BYTES", VAULT_UPLOAD_MAX_BYTES),
+    ):
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError:
+                raise ValueError(f"{name} must be an integer, got {raw!r}")
+        else:
+            value = parsed
+        if value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value}")
+    if VAULT_UPLOAD_URL_MAX_TTL_SECONDS < VAULT_UPLOAD_URL_TTL_SECONDS:
+        raise ValueError(
+            "VAULT_UPLOAD_URL_MAX_TTL_SECONDS must not be smaller than "
+            f"VAULT_UPLOAD_URL_TTL_SECONDS ({VAULT_UPLOAD_URL_MAX_TTL_SECONDS} < "
+            f"{VAULT_UPLOAD_URL_TTL_SECONDS})"
+        )
+    staging = UPLOAD_STAGING_DIR.expanduser()
+    vault_root = VAULT_PATH.expanduser()
+    try:
+        staging.resolve().relative_to(vault_root.resolve())
+    except ValueError:
+        return
+    raise ValueError(
+        f"VAULT_UPLOAD_STAGING_DIR resolves inside the vault ({staging}); the vault tools "
+        "could reach the grants. Choose a path outside VAULT_PATH."
+    )
+
+
+def _validate_download_settings() -> None:
+    """Fail closed on the signed-download lifetimes, by the upload settings' rules."""
+    for name, parsed in (
+        ("VAULT_DOWNLOAD_URL_TTL_SECONDS", VAULT_DOWNLOAD_URL_TTL_SECONDS),
+        ("VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS", VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS),
+    ):
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError:
+                raise ValueError(f"{name} must be an integer, got {raw!r}")
+        else:
+            value = parsed
+        if value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value}")
+    if VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS < VAULT_DOWNLOAD_URL_TTL_SECONDS:
+        raise ValueError(
+            "VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS must not be smaller than "
+            f"VAULT_DOWNLOAD_URL_TTL_SECONDS ({VAULT_DOWNLOAD_URL_MAX_TTL_SECONDS} < "
+            f"{VAULT_DOWNLOAD_URL_TTL_SECONDS})"
+        )
+
+
+def _validate_semantic_settings() -> None:
+    """Fail closed on the semantic-search settings.
+
+    A value that is neither on nor off stops startup, so a typo cannot leave the operator
+    believing the feature is on. With it on, the index must resolve outside the vault, the
+    same rule as the audit log: it holds an excerpt of every note, and inside the vault the
+    vault tools could reach it.
+    """
+    if VAULT_SEMANTIC_SEARCH.lower() not in {"", "0", "false", "no", "off", "1", "true", "yes", "on"}:
+        raise ValueError(
+            "VAULT_SEMANTIC_SEARCH must be on (1/true/yes/on) or off (0/false/no/off), "
+            f"got {VAULT_SEMANTIC_SEARCH!r}"
+        )
+    if not semantic_search_enabled():
+        return
+    db = VAULT_SEMANTIC_DB_PATH.expanduser().resolve()
+    vault = VAULT_PATH.expanduser().resolve()
+    if db == vault or vault in db.parents:
+        raise ValueError(
+            f"VAULT_SEMANTIC_DB_PATH resolves inside the vault ({db}); the vault tools could "
+            "reach the index. Choose a path outside VAULT_PATH."
+        )
