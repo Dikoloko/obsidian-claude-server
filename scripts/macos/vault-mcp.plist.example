@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  One vault server, started at login and restarted when it stops.
+  Copy to ~/Library/LaunchAgents/com.obsidian-claude-server.a.plist, replace every
+  REPLACE_WITH_..., then: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.obsidian-claude-server.a.plist
+  Cloudflare Access mode only: no token or password in this file.
+  The working directory is the repository, never the vault.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.obsidian-claude-server.a</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>REPLACE_WITH_REPO/.venv/bin/vault-mcp</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>VAULT_PATH</key>
+        <string>REPLACE_WITH_HOME/Obsidian/REPLACE_WITH_VAULT_NAME</string>
+        <key>VAULT_MCP_HOST</key>
+        <string>127.0.0.1</string>
+        <key>VAULT_MCP_PORT</key>
+        <string>8421</string>
+        <key>VAULT_MCP_PUBLIC_URL</key>
+        <string>https://a.jouwdomein.com</string>
+        <key>VAULT_MCP_ALLOWED_HOSTS</key>
+        <string>a.jouwdomein.com</string>
+        <key>VAULT_MCP_FORWARDED_ALLOW_IPS</key>
+        <string>127.0.0.1</string>
+        <key>VAULT_MCP_CF_ACCESS_TEAM_DOMAIN</key>
+        <string>REPLACE_WITH_TEAM.cloudflareaccess.com</string>
+        <key>VAULT_MCP_CF_ACCESS_AUD</key>
+        <string>REPLACE_WITH_AUD_TAG</string>
+        <key>OAUTH_CLIENTS_PATH</key>
+        <string>REPLACE_WITH_HOME/.vault-mcp/a/oauth/oauth_clients.json</string>
+        <key>VAULT_AUDIT_LOG_PATH</key>
+        <string>REPLACE_WITH_HOME/.vault-mcp/a/audit.jsonl</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>REPLACE_WITH_REPO</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>REPLACE_WITH_HOME/.vault-mcp/a/logs/server.log</string>
+    <key>StandardErrorPath</key>
+    <string>REPLACE_WITH_HOME/.vault-mcp/a/logs/server-error.log</string>
+</dict>
+</plist>

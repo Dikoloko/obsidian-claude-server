@@ -1,4 +1,4 @@
-> **Aangepaste kopie.** Dit is een nagelezen en aangepaste kopie van obsidian-web-mcp voor een Windows-pc achter een Cloudflare-tunnel, met inloggen via Cloudflare Access. Lees eerst [WIJZIGINGEN.md](WIJZIGINGEN.md) (wat er anders is) en [INSTALLATIE-WINDOWS.md](INSTALLATIE-WINDOWS.md) (installeren voor één vault). De uitleg hieronder is die van de oorspronkelijke maker en klopt niet overal meer voor deze kopie.
+> **Aangepaste kopie.** Dit is een nagelezen en aangepaste kopie van obsidian-web-mcp voor een Windows-pc of Mac achter een Cloudflare-tunnel, met inloggen via Cloudflare Access. Lees eerst [WIJZIGINGEN.md](WIJZIGINGEN.md) (wat er anders is) en [INSTALLATIE-WINDOWS.md](INSTALLATIE-WINDOWS.md) of [INSTALLATIE-MAC.md](INSTALLATIE-MAC.md) (installeren voor één vault). De uitleg hieronder is die van de oorspronkelijke maker en klopt niet overal meer voor deze kopie.
 
 # obsidian-web-mcp
 

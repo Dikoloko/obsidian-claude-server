@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The Cloudflare tunnel, started at login and restarted when it stops.
+  Copy to ~/Library/LaunchAgents/com.obsidian-claude-server.tunnel.plist, replace every
+  REPLACE_WITH_..., then: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.obsidian-claude-server.tunnel.plist
+  The tunnel settings are in ~/.cloudflared/config.yml (see ../windows/cloudflared-config.example.yml).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.obsidian-claude-server.tunnel</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>REPLACE_WITH_CLOUDFLARED_PATH</string>
+        <string>tunnel</string>
+        <string>--config</string>
+        <string>REPLACE_WITH_HOME/.cloudflared/config.yml</string>
+        <string>run</string>
+        <string>vault</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>REPLACE_WITH_HOME/.vault-mcp/tunnel/tunnel.log</string>
+    <key>StandardErrorPath</key>
+    <string>REPLACE_WITH_HOME/.vault-mcp/tunnel/tunnel-error.log</string>
+</dict>
+</plist>
